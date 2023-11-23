@@ -15,6 +15,7 @@ import (
 
 	v1 "kubevirt.io/kubevirt/pkg/handler-launcher-com/cmd/v1"
 	"kubevirt.io/kubevirt/pkg/util"
+	hw_utils "kubevirt.io/kubevirt/pkg/util/hardware"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 )
 
@@ -409,16 +410,28 @@ func FormatDomainIOThreadPin(vmi *v12.VirtualMachineInstance, domain *api.Domain
 	return nil
 }
 
-func FormatEmulatorThreadPin(cpuPool VCPUPool) (string, error) {
+func FormatEmulatorThreadPin(cpuPool VCPUPool, CPUManagerPolicyBetaOption v12.CPUManagerPolicyBetaOptions) (string, error) {
 	var emulatorThreads []uint32
 
-	availableThread, err := cpuPool.FitThread()
-	if err != nil {
-		e := fmt.Errorf("no CPU allocated for the emulation thread: %v", err)
-		log.Log.Reason(e).Error("failed to format emulation thread pin")
-		return "", e
+	mustAllocateFullCores := CPUManagerPolicyBetaOption == v12.CPUManagerPolicyBetaOptionFullpCPUsOnly
+	if mustAllocateFullCores {
+		availableCoreCPUTune, err := cpuPool.FitCores()
+		if err != nil {
+			return "", fmt.Errorf("no Core allocated for the emulation thread: %v", err)
+		}
+		emulatorThreads, err = convertVCPUPinToCPUList(availableCoreCPUTune.VCPUPin)
+		if err != nil {
+			return "", fmt.Errorf("failed to convert vCPUPin to CPUList: %v", err)
+		}
+	} else {
+		availableThread, err := cpuPool.FitThread()
+		if err != nil {
+			e := fmt.Errorf("no CPU allocated for the emulation thread: %v", err)
+			log.Log.Reason(e).Error("failed to format emulation thread pin")
+			return "", e
+		}
+		emulatorThreads = append(emulatorThreads, availableThread)
 	}
-	emulatorThreads = append(emulatorThreads, availableThread)
 
 	return convertCPUListToCPUSet(emulatorThreads), nil
 }
@@ -469,7 +482,8 @@ func AdjustDomainForTopologyAndCPUSet(domain *api.Domain, vmi *v12.VirtualMachin
 
 	var emulatorThreadsCPUSet string
 	if vmi.Spec.Domain.CPU.IsolateEmulatorThread {
-		if emulatorThreadsCPUSet, err = FormatEmulatorThreadPin(cpuPool); err != nil {
+		CPUManagerPolicyBetaOption := v12.CPUManagerPolicyBetaOptions(vmi.Annotations[v12.CPUManagerPolicyBetaOptionsAnnotation])
+		if emulatorThreadsCPUSet, err = FormatEmulatorThreadPin(cpuPool, CPUManagerPolicyBetaOption); err != nil {
 			log.Log.Reason(err).Error("failed to format emulation thread pin")
 			return err
 		}
@@ -512,6 +526,22 @@ func convertCPUListToCPUSet(allocatedCPUs []uint32) string {
 		allocatedCPUsString = append(allocatedCPUsString, strconv.Itoa(int(cpu)))
 	}
 	return strings.Join(allocatedCPUsString, delimiter)
+}
+
+func convertVCPUPinToCPUList(vcpuPin []api.CPUTuneVCPUPin) ([]uint32, error) {
+	var emulatorThreads []uint32
+	for _, vcpu := range vcpuPin {
+		pinnedCPUsList, err := hw_utils.ParseCPUSetLine(vcpu.CPUSet, 100)
+		if err != nil {
+			e := fmt.Errorf("no cores allocated for the emulation threads: %v", err)
+			return emulatorThreads, e
+		}
+
+		for _, pinnedCPU := range pinnedCPUsList {
+			emulatorThreads = append(emulatorThreads, uint32(pinnedCPU))
+		}
+	}
+	return emulatorThreads, nil
 }
 
 func cpuToCell(topology *v1.Topology) map[uint32]*v1.Cell {
